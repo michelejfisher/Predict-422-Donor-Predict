@@ -1,0 +1,1323 @@
+---
+title: "Predicting Charitable Donations"
+author: Michele Fisher
+date: August 2017
+output: 
+  github_document:
+    html_preview: false
+    toc: true
+    toc_depth: 2
+---
+
+OBJECTIVE: A charitable organization wishes to improve the cost-effectiveness of their direct marketing campaigns to previous donors. Machine learning models are developed using data from the most recent campaign. They have two aims: 
+
+1) Classify likely donors so that the expected net profit is maximized.
+
+2) Predict donation amounts for donors so that the mean prediction error is minimized.
+```{r libraries}
+# load all required libraries
+packages <- c("plyr", "caret", "car", "class", "corrplot", "dplyr", "e1071", "forecast", 
+              "gbm", "ggridges", "ggplot2", "gridExtra", "ISLR", "magrittr", "MASS", 
+              "randomForest", "ranger", "RColorBrewer", "tree", "glmnet")
+purrr::walk(packages, library, character.only = TRUE, warn.conflicts = FALSE)
+```
+
+Data
+----
+Load and check the data.  
+There are no missing values except for those to be predicted.
+
+```{r data}
+charity <- read.csv(file.choose()) # load the "charity.csv" file
+summary(charity) # summarize the features.
+```
+
+Exploratory Data Analysis
+-------------------------
+
+###Likelihood of Donation
+
+Perform exploratory data analysis on the training and validation data sets to investigate their relationship to the likelihood to donate.
+
+```{r EDA.c, fig.height=4, fig.width=5, fig.align='center'}
+charity %>% 
+  mutate(reg5=1-(reg1+reg2+reg3+reg4), 
+         donrf=as.factor(donr), 
+         homef=as.factor(home), 
+         hincf=as.factor(hinc),
+         genff=as.factor(genf), 
+         wratf=as.factor(wrat),
+         recent=as.factor(ifelse(tdon<12,1,0)),
+         # donated within the last year
+         donrdue=as.factor(ifelse((tdon>12)&(tdon<24),1,0)), 
+         # last donation between 1-2 years ago  
+         tgif.npro=tgif/npro, 
+         # average donation per campaign
+         incgif=as.factor(ifelse((rgif>=agif),1,0))) %>% 
+         # most recent donation is larger than average
+  filter(!is.na(donr)) -> charity.tv
+  # Filter out the data from the test set
+
+charity.tv %>%
+  group_by(donr) %>%
+  summarize(donr.reg1=sum(reg1),
+            donr.reg2=sum(reg2),
+            donr.reg3=sum(reg3),
+            donr.reg4=sum(reg4),
+            donr.reg5=sum(reg5)) -> donr.reg
+
+# Regions 1 and 2 have a higher proportion of donors so region may be predictive
+# May be able to group regions 3,4,5
+barplot(height=as.matrix(donr.reg[,-1]), col=c("pink","light blue"), 
+        legend.text=c("Not Donor","Donor"))
+
+# Home Owners are more likely to be donors
+ggplot(charity.tv, aes(donrf,homef)) + geom_jitter()
+
+# People with fewer children are more likely to donate
+ggplot(charity.tv, aes(donrf,chld)) + geom_boxplot()
+
+# People in middle income bracket are more likely to donate
+ggplot(charity.tv, aes(hincf)) + geom_bar(aes(fill=donrf))
+
+# Gender is unrelated to likelihood to donate
+ggplot(charity.tv, aes(genff)) +
+  geom_bar(aes(fill=donrf), position="fill")
+
+# Higher wealth ratings are more likely to be donors
+ggplot(charity.tv, aes(wratf)) +
+  geom_bar(aes(fill=donrf), position="fill")
+
+# Average house value is skewed but does not appear to differ by donor status
+# log transform of avhv looks more normal but invariate to donor status
+plot1 <- ggplot(charity.tv, aes(x=avhv, y=donrf)) + geom_density_ridges(bandwidth=12)
+plot2 <- ggplot(charity.tv, aes(y=avhv, x=donrf)) + geom_boxplot()
+charity.tv$logavhv <- log(charity.tv$avhv)
+plot3 <- ggplot(charity.tv, aes(x=logavhv, y=donrf)) + geom_density_ridges(bandwidth=0.07)
+plot4 <- ggplot(charity.tv, aes(y=logavhv, x=donrf)) + geom_boxplot()
+grid.arrange(plot1, plot2, plot3, plot4, ncol=2)
+
+# Median family income is skewed but does not differ much by donor status
+# the same for the log transform of the median family income
+plot1 <- ggplot(charity.tv, aes(x=incm, y=donrf)) + geom_density_ridges(bandwidth=4)
+plot2 <- ggplot(charity.tv, aes(y=incm, x=donrf)) + geom_boxplot()
+charity.tv$logincm <- log(charity.tv$incm)
+plot3 <- ggplot(charity.tv, aes(x=logincm, y=donrf)) + geom_density_ridges(bandwidth=.09)
+plot4 <- ggplot(charity.tv, aes(y=logincm, x=donrf)) + geom_boxplot()
+grid.arrange(plot1, plot2, plot3, plot4, ncol=2)
+
+# Average family income is skewed but does to differ much by donor status
+# the same for the log transform of the average family income
+plot1 <- ggplot(charity.tv, aes(x=inca, y=donrf)) + geom_density_ridges(bandwidth=4)
+plot2 <- ggplot(charity.tv, aes(y=inca, x=donrf)) + geom_boxplot()
+charity.tv$loginca <- log(charity.tv$inca)
+plot3 <- ggplot(charity.tv, aes(x=loginca, y=donrf)) + geom_density_ridges(bandwidth=.07)
+plot4 <- ggplot(charity.tv, aes(y=loginca, x=donrf)) + geom_boxplot()
+grid.arrange(plot1, plot2, plot3, plot4, ncol=2)
+
+# Percent categorized as low income is very skewed and has a number of zeros.
+# It does not appear to differ much by donor status. 
+plot1 <- ggplot(charity.tv, aes(plow)) + geom_histogram(binwidth=5)
+plot2 <- ggplot(charity.tv, aes(x=plow, y=donrf)) + geom_density_ridges(bandwidth=2)
+plot3 <- ggplot(charity.tv, aes(y=plow, x=donrf)) + geom_boxplot()
+grid.arrange(plot1, plot2, plot3, ncol=3)
+
+# Box Cox transformation of plow is bimodal and does not differ by donor status.
+lambda.plow <- BoxCox.lambda(charity.tv$plow) # = 0.11
+charity.tv$plow.t <- BoxCox(charity.tv$plow, lambda.plow)
+plot1 <- ggplot(charity.tv, aes(plow.t)) + geom_histogram(binwidth=1)
+plot2 <- ggplot(charity.tv, aes(x=plow.t, y=donrf)) + geom_density_ridges(bandwidth=.3)
+plot3 <- ggplot(charity.tv, aes(y=plow.t, x=donrf)) + geom_boxplot()
+grid.arrange(plot1, plot2, plot3, ncol=3)
+
+# People who have been approached more times may be slightly more likely to donate.
+plot1 <- ggplot(charity.tv, aes(npro)) + geom_histogram(binwidth = 10)
+plot2 <- ggplot(charity.tv, aes(x=npro, y=donrf)) + geom_density_ridges(bandwidth=5)
+plot3 <- ggplot(charity.tv, aes(y=npro, x=donrf)) + geom_boxplot()
+grid.arrange(plot1, plot2, plot3, ncol=3)
+
+# Dollar amount of lifetime gifts is skewed with outliers.
+# Box Cox transformation of the dollar amount of lifetime gifts to data is better. 
+# It does not appear to differ much by donor status.
+plot1 <- ggplot(charity.tv, aes(tgif)) + geom_histogram(binwidth=100)
+plot2 <- ggplot(charity.tv, aes(x=tgif, y=donrf)) + geom_density_ridges(bandwidth=10)
+plot3 <- ggplot(charity.tv, aes(y=tgif, x=donrf)) + geom_boxplot()
+lambda.tgif <- BoxCox.lambda(charity.tv$tgif) # = -0.55
+charity.tv$tgif.t <- BoxCox(charity.tv$tgif, lambda.tgif)
+plot4 <- ggplot(charity.tv, aes(tgif.t)) + geom_histogram(binwidth=.02)
+plot5 <- ggplot(charity.tv, aes(x=tgif.t, y=donrf)) + geom_density_ridges(bandwidth=0.01)
+plot6 <- ggplot(charity.tv, aes(y=tgif.t, x=donrf)) + geom_boxplot()
+grid.arrange(plot1, plot2, plot3, plot4, plot5, plot6, ncol=3)
+
+# Dollar amount of largest gifts is skewed with outliers. 
+# It is hard to see if it differs by donor status.
+plot1 <- ggplot(charity.tv, aes(lgif)) + geom_histogram(binwidth=50)
+plot2 <- ggplot(charity.tv, aes(x=lgif, y=donrf)) + geom_density_ridges(bandwidth=2)
+plot3 <- ggplot(charity.tv, aes(y=lgif, x=donrf)) + geom_boxplot()
+lambda.lgif <- BoxCox.lambda(charity.tv$lgif) # = -0.32
+charity.tv$lgif.t <- BoxCox(charity.tv$lgif, lambda.lgif)
+plot4 <- ggplot(charity.tv, aes(lgif.t)) + geom_histogram(binwidth=.1)
+plot5 <- ggplot(charity.tv, aes(x=lgif.t, y=donrf)) + geom_density_ridges(bandwidth=0.05)
+plot6 <- ggplot(charity.tv, aes(y=lgif.t, x=donrf)) + geom_boxplot()
+grid.arrange(plot1, plot2, plot3, plot4, plot5, plot6, ncol=3)
+
+# Dollar amount of most recent gift is skewed with outliers.
+# Box Cox transformation of the dollar amount of most recent gift is better. 
+# It does not appear to differ by donor status.
+plot1 <- ggplot(charity.tv, aes(rgif)) + geom_histogram(binwidth=10)
+plot2 <- ggplot(charity.tv, aes(x=rgif, y=donrf)) + geom_density_ridges(bandwidth=2)
+plot3 <- ggplot(charity.tv, aes(y=rgif, x=donrf)) + geom_boxplot()
+lambda.rgif <- BoxCox.lambda(charity.tv$rgif) # = -0.25
+charity.tv$rgif.t <- BoxCox(charity.tv$rgif, lambda.rgif)
+plot4 <- ggplot(charity.tv, aes(rgif.t)) + geom_histogram(binwidth=0.2)
+plot5 <- ggplot(charity.tv, aes(x=rgif.t, y=donrf)) + geom_density_ridges(bandwidth=.07)
+plot6 <- ggplot(charity.tv, aes(y=rgif.t, x=donrf)) + geom_boxplot()
+grid.arrange(plot1, plot2, plot3, plot4, plot5, plot6, ncol=3)
+
+# Dollar amount of average gift is skewed with outliers.
+# Box Cox transformation of the average dollar amount of a gifts is better. 
+# It does not appear to differ by donor status.
+plot1 <- ggplot(charity.tv, aes(agif)) + geom_histogram(binwidth=5)
+plot2 <- ggplot(charity.tv, aes(x=agif, y=donrf)) + geom_density_ridges(bandwidth=1)
+plot3 <- ggplot(charity.tv, aes(y=agif, x=donrf)) + geom_boxplot()
+lambda.agif <- BoxCox.lambda(charity.tv$agif) # = -0.38
+charity.tv$agif.t <- BoxCox(charity.tv$agif, lambda.agif)
+plot4 <- ggplot(charity.tv, aes(agif.t)) + geom_histogram(binwidth=.15)
+plot5 <- ggplot(charity.tv, aes(x=agif.t, y=donrf)) + geom_density_ridges(bandwidth=0.04)
+plot6 <- ggplot(charity.tv, aes(y=agif.t, x=donrf)) + geom_boxplot()
+grid.arrange(plot1, plot2, plot3, plot4, plot5, plot6, ncol=3)
+
+# Number of months since last donation is slightly skewed.
+# Most lags vary from 12-24 months. It is hard to see if it differs by donor status.
+plot1 <- ggplot(charity.tv, aes(tdon)) + geom_histogram(binwidth=1)
+plot2 <- ggplot(charity.tv, aes(x=tdon, y=donrf)) + geom_density_ridges(bandwidth=1)
+plot3 <- ggplot(charity.tv, aes(y=tdon, x=donrf)) + geom_boxplot()
+grid.arrange(plot1, plot2, plot3, ncol=3)
+
+# Number of months between first two donations is slightly skewed.
+# Most lags are under 6 months. It is hard to see if it differs by donor status.
+plot1 <- ggplot(charity.tv, aes(tlag)) + geom_histogram(binwidth=2)
+plot2 <- ggplot(charity.tv, aes(x=tlag, y=donrf)) + geom_density_ridges(bandwidth=.5)
+plot3 <- ggplot(charity.tv, aes(y=tlag, x=donrf)) + geom_boxplot()
+grid.arrange(plot1, plot2, plot3, ncol=3)
+
+# Recent donors (<1 year) are slightly less likely to donate.
+ggplot(charity.tv, aes(recent, donrf)) + geom_jitter()
+
+# Donors who have not donated between 1 to 2 years are slightly more likely to donate.
+ggplot(charity.tv, aes(donrdue, donrf)) + geom_jitter()
+
+# Donors who donated more on average per campaign do not appear to be more likely to donate.
+ggplot(charity.tv, aes(y=log(tgif.npro), x=donrf)) + geom_boxplot()
+
+# Donors who donated more last time than average do not appear to be more likely to donate.
+ggplot(charity.tv, aes(incgif, donrf)) + geom_jitter()
+```
+
+####Correlations
+Investigate the pairwise correlations of the numeric variables to donr.
+
+```{r Corr.c}
+charity.tv %>%
+  dplyr::select(donr, avhv, incm, inca, plow, npro, tgif, lgif, rgif, agif, tdon, tlag) %>%
+  cor(use = 'pairwise.complete.obs') -> corrtab
+print(corrtab)
+# plot correlation matrix
+corrplot(corrtab, type="lower", method="color", main="", col=brewer.pal(n=8, name="RdBu"),diag=FALSE)
+
+# pairs plot showing correlation of income variables
+pairs(charity.tv[,11:14],col=charity.tv$donr+1)
+
+# pairs plot showing correlation of campaign variables
+pairs(charity.tv[,15:20],col=charity.tv$donr+1)
+```
+
+###Size of Donation
+
+```{r EDA.y, fig.height=4, fig.width=5, fig.align='center'}
+#Filter the training and validation data sets for actual donors
+charity.tv %>%
+  filter(donr==1) %>% 
+  mutate("region"=ifelse(reg1==1,"reg1",
+                  ifelse(reg2==1,"reg2",
+                  ifelse(reg3==1,"reg3",
+                  ifelse(reg4==1,"reg4","reg5"))))) %>%
+  mutate("chldf"=as.factor(chld)) -> charity.tv1
+
+# Regions 3 and 4 have slightly higher donation amounts so region may be predictive
+ggplot(charity.tv1, aes(y=damt,x=region)) + geom_boxplot()
+
+# Home Owners may make slightly higher donations
+ggplot(charity.tv1, aes(y=damt,x=homef)) + geom_boxplot()
+
+# There is a slight decrease in the amount of donations with increase in children
+ggplot(charity.tv1, aes(y=damt,x=chldf)) + geom_boxplot()
+
+# There is a slight increase in the amount of donations with increase household income
+ggplot(charity.tv1, aes(y=damt, x=hincf)) + geom_boxplot()
+
+# Gender is unrelated to amount of donation
+ggplot(charity.tv1, aes(y=damt, x=genff)) + geom_boxplot()
+
+# Mid-wealth ratings correlate to slightly higher donations
+ggplot(charity.tv1, aes(y=damt, x=wratf)) + geom_boxplot()
+
+# Average house value is skewed but does not appear to be related to higher donations
+plot1 <- ggplot(charity.tv1, aes(x=avhv, y=damt)) + geom_jitter()
+plot2 <- ggplot(charity.tv1, aes(x=logavhv, y=damt)) + geom_jitter()
+grid.arrange(plot1,plot2,ncol=2)
+
+# Median family income is skewed but does not appear to be related to higher donations
+plot1 <- ggplot(charity.tv1, aes(x=incm, y=damt)) + geom_jitter()
+plot2 <- ggplot(charity.tv1, aes(x=logincm, y=damt)) + geom_jitter()
+grid.arrange(plot1, plot2, ncol=2)
+
+# Average family income is skewed but does to be related to higher donations
+plot1 <- ggplot(charity.tv1, aes(x=inca, y=damt)) + geom_jitter()
+plot2 <- ggplot(charity.tv1, aes(x=loginca, y=damt)) + geom_jitter()
+grid.arrange(plot1, plot2, ncol=2)
+
+# Percent categorized as low income is very skewed and has a number of zeros
+# Box-Cox transformation is bi-modal 
+plot1 <- ggplot(charity.tv1, aes(x=plow, y=damt)) + geom_jitter()
+plot2 <- ggplot(charity.tv1, aes(x=plow.t, y=damt)) + geom_jitter()
+grid.arrange(plot1, plot2, ncol=2)
+
+# People who have been approached more don't seem to donate any more per time
+ggplot(charity.tv1, aes(x=npro,y=damt)) + geom_jitter()
+
+# Dollar amount of lifetime gifts is skewed
+# Box-Cox transformation reduces skew. Impact on donation amount not clear. 
+plot1 <- ggplot(charity.tv1, aes(x=tgif, y=damt)) + geom_jitter()
+plot2 <- ggplot(charity.tv1, aes(x=tgif.t, y=damt)) + geom_jitter()
+grid.arrange(plot1, plot2, ncol=2)
+
+# Dollar amount of largest gifts is skewed
+# Box-Cox transformation reduces skew. 
+# Amount of donation is higher if largest gift is higher.
+plot1 <- ggplot(charity.tv1, aes(x=lgif, y=damt)) + geom_jitter()
+plot2 <- ggplot(charity.tv1, aes(x=lgif.t, y=damt)) + geom_jitter()
+grid.arrange(plot1, plot2, ncol=2)
+
+# Dollar amount of most recent gift is skewed
+# Box-Cox transformation reduces skew. 
+# Amount of donation is higher if recent gift is higher.
+plot1 <- ggplot(charity.tv1, aes(x=rgif, y=damt)) + geom_jitter()
+plot2 <- ggplot(charity.tv1, aes(x=rgif.t, y=damt)) + geom_jitter()
+grid.arrange(plot1, plot2, ncol=2)
+
+# Dollar amount of average gift is skewed
+# Box-Cox transformation reduces skew. 
+# Amount of donation is higher if average gift is higher.
+plot1 <- ggplot(charity.tv1, aes(x=agif, y=damt)) + geom_jitter()
+plot2 <- ggplot(charity.tv1, aes(x=agif.t, y=damt)) + geom_jitter()
+grid.arrange(plot1, plot2, ncol=2)
+
+# Number of months since last donation does nto appear to impact donation size.
+ggplot(charity.tv1, aes(x=tdon, y=damt)) + geom_jitter()
+
+# Number of months between first two donations is slightly skewed.
+# Most lags are under 6 months. It is hard to see if it differs by donor amount.
+ggplot(charity.tv1, aes(x=tlag, y=damt)) + geom_jitter()
+
+# Donors who have donated recently are not likely to donate more.
+ggplot(charity.tv1, aes(x=recent, y=damt)) + geom_boxplot()
+
+# Donors who have not donated in 1-2 years are not likely to donate more.
+ggplot(charity.tv1, aes(x=donrdue, y=damt)) + geom_boxplot()
+
+# Donors who donated more last time than average donate slightly more.
+ggplot(charity.tv1, aes(x=incgif, y=damt)) + geom_boxplot()
+
+# Donors who donated more on average per campaign do not appear to donate more.
+ggplot(charity.tv1, aes(x=log(tgif.npro), y=damt)) + geom_jitter()
+
+```
+####Correlations
+Investigate the pairwise correlations of the numeric variables to damt.
+
+```{r Corr.y}
+charity.tv1 %>%
+  dplyr::select(damt, avhv, incm, inca, plow, npro, tgif, lgif, rgif, agif, tdon, tlag) %>%
+  cor(use = 'pairwise.complete.obs') -> corrtab.y
+print(corrtab.y)
+# plot correlation matrix
+corrplot(corrtab.y, type="lower", method="color", main="", 
+         col=brewer.pal(n=8, name="RdBu"),diag=FALSE)
+```
+
+Transformations
+---------------
+```{r Transformations}
+# transform predictors that are skewed using a log or Box-Cox transformation.
+charity.t <- charity
+charity.t$avhv <- log(charity.t$avhv)
+charity.t$incm <- log(charity.t$incm)
+charity.t$inca <- log(charity.t$inca)
+charity.t$tgif <- BoxCox(charity.t$tgif, lambda.tgif)
+charity.t$lgif <- BoxCox(charity.t$lgif, lambda.lgif)
+charity.t$rgif <- BoxCox(charity.t$rgif, lambda.rgif)
+charity.t$agif <- BoxCox(charity.t$agif, lambda.agif)
+```
+
+Data Set-Up
+-----------
+```{r setup}
+# set up data for analysis
+
+data.train <- charity.t[charity$part=="train",]
+x.train <- data.train[,2:21]
+c.train <- data.train[,22] # donr
+c.train.fact <- make.names(data.train[,22]) # convert donr to a factor donrf
+
+n.train.c <- length(c.train) # 3984
+y.train <- data.train[c.train==1,23] # damt for observations with donr=1
+n.train.y <- length(y.train) # 1995
+
+data.valid <- charity.t[charity$part=="valid",]
+x.valid <- data.valid[,2:21]
+c.valid <- data.valid[,22] # donr
+c.valid.fact <- make.names(data.valid[,22]) # convert donr to a factor donrf
+
+n.valid.c <- length(c.valid) # 2018
+y.valid <- data.valid[c.valid==1,23] # damt for observations with donr=1
+n.valid.y <- length(y.valid) # 999
+
+data.test <- charity.t[charity$part=="test",]
+n.test <- dim(data.test)[1] # 2007
+x.test <- data.test[,2:21]
+
+x.train.mean <- apply(x.train, 2, mean)
+x.train.sd <- apply(x.train, 2, sd)
+x.train.std <- t((t(x.train)-x.train.mean)/x.train.sd) # standardize to mean=0 and sd=1
+apply(x.train.std, 2, mean) # check zero mean
+apply(x.train.std, 2, sd) # check unit sd
+data.train.std.c <- data.frame(x.train.std, donr=c.train, donrf= c.train.fact) # to classify donr
+data.train.std.y <- data.frame(x.train.std[c.train==1,], damt=y.train) # to predict damt when donr=1
+
+x.valid.std <- t((t(x.valid)-x.train.mean)/x.train.sd) # standardize using training mean and sd
+data.valid.std.c <- data.frame(x.valid.std, donr=c.valid, donrf=c.valid.fact) # to classify donr
+data.valid.std.y <- data.frame(x.valid.std[c.valid==1,], damt=y.valid) # to predict damt when donr=1
+
+x.test.std <- t((t(x.test)-x.train.mean)/x.train.sd) # standardize using training mean and sd
+data.test.std <- data.frame(x.test.std)
+```
+
+Classification Models
+---------------------
+
+###Linear Discriminant Analysis
+
+Although LDA should not be used with qualitative predictors, it can sometimes find a good predictive model
+
+```{r LDA2.c}
+model.lda2 <- lda(donr ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + I(hinc^2) + genf 
+                  + wrat + avhv + incm + inca + plow + npro + tgif + lgif + rgif + tdon 
+                  + tlag + agif, data.train.std.c) 
+model.lda2
+plot(model.lda2)
+
+post.valid.lda2 <- predict(model.lda2, data.valid.std.c)$posterior[,2] # n.valid.c post probs
+
+# calculate ordered profit function using average donation = $14.50 and mailing cost = $2
+don.avg <- 14.5
+mail.cost <- 2
+profit.lda2 <- cumsum(don.avg*c.valid[order(post.valid.lda2, decreasing=T)]-mail.cost)
+
+# plot how profits change as more mailings are made
+plot(profit.lda2, type="l", main="Profits", xlab="Mailings", ylab="$") 
+n.mail.valid <- which.max(profit.lda2) # number of mailings that maximizes profits
+results.lda2 <- c(n.mail.valid, max(profit.lda2))# report number of mailings and maximum profit
+# 1355.0 11659.5
+results.lda2
+
+cutoff.lda2 <- sort(post.valid.lda2, decreasing=T)[n.mail.valid+1] # set cutoff based on n.mail.valid
+
+chat.valid.lda2 <- ifelse(post.valid.lda2>cutoff.lda2, 1, 0) # mail to everyone above the cutoff
+truth <- factor(c.valid)
+(cfs.lda2 <- confusionMatrix(factor(chat.valid.lda2), truth)$table)
+#          Reference
+#Prediction   0   1
+#         0 655   8
+#         1 364 991
+```
+
+###Use tree for Variable Selection and repeat LDA.
+
+```{r LDA3.c}
+model.lda3 <- lda(donr ~ reg2  + home + chld + I(hinc^2) + wrat + tdon + tlag, data.train.std.c)
+model.lda3
+plot(model.lda3)
+
+post.valid.lda3 <- predict(model.lda3, data.valid.std.c)$posterior[,2] # n.valid.c post probs
+
+# calculate ordered profit function using average donation = $14.50 and mailing cost = $2
+profit.lda3 <- cumsum(don.avg*c.valid[order(post.valid.lda3, decreasing=T)]-mail.cost)
+
+# plot how profits change as more mailings are made
+plot(profit.lda3, type="l", main="Profits", xlab="Mailings", ylab="$")
+n.mail.valid <- which.max(profit.lda3) # number of mailings that maximizes profits
+results.lda3 <- c(n.mail.valid, max(profit.lda3))# report number of mailings and maximum profit
+results.lda3
+# 1489 11406
+
+cutoff.lda3 <- sort(post.valid.lda3, decreasing=T)[n.mail.valid+1] # set cutoff based on n.mail.valid
+chat.valid.lda3 <- ifelse(post.valid.lda3>cutoff.lda3, 1, 0) # mail to everyone above the cutoff
+(cfs.lda3 <- confusionMatrix(factor(chat.valid.lda3), truth)$table)
+#          Reference
+#Prediction   0   1
+#         0 522   7
+#         1 497 992
+# Check number of mailings
+sum(cfs.lda3[2,])
+# Check potential profit
+don.avg*cfs.lda3[2,2] - 
+  mail.cost*sum(cfs.lda3[2,])
+```
+###Logistic Regression
+
+```{r Log2.c}
+model.log2 <- glm(donr ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + I(hinc^2) + genf + 
+                    wrat + avhv + incm + inca + plow + npro + tgif + lgif + rgif + tdon + 
+                    tlag + agif, data.train.std.c, family=binomial("logit"))
+summary(model.log2)
+
+post.valid.log2 <- predict(model.log2, data.valid.std.c, type="response") # n.valid post probs
+
+profit.log2 <- cumsum(don.avg*c.valid[order(post.valid.log2, decreasing=T)]-mail.cost)
+
+# plot how profits change as more mailings are made
+plot(profit.log2, type="l", main="Profits", xlab="Mailings", ylab="$")
+n.mail.valid <- which.max(profit.log2) # number of mailings that maximizes profits
+results.log2 <- c(n.mail.valid, max(profit.log2)) # report number of mailings and maximum profit
+results.log2
+# 1354 11647
+
+cutoff.log2 <- sort(post.valid.log2, decreasing=T)[n.mail.valid+1] # set cutoff based on n.mail.valid
+chat.valid.log2 <- ifelse(post.valid.log2>cutoff.log2, 1, 0) # mail to everyone above the cutoff
+(csf.log2 <- confusionMatrix(factor(chat.valid.log2), truth)$table)
+#          Reference
+#Prediction   0   1
+#         0 655   9
+#         1 364 990
+```
+
+Logistic regression with forward variable selection.
+
+```{r Log3.c}
+model.log0 <- glm(donr~1, data=data.train.std.c, family=binomial("logit"))
+model.log3 <- step(model.log0, scope=formula(model.log2), direction="forward",k=2)
+
+post.valid.log3 <- predict(model.log3, data.valid.std.c, type="response") # n.valid post probs
+
+profit.log3 <- cumsum(don.avg*c.valid[order(post.valid.log3, decreasing=T)]-mail.cost)
+
+# plot how profits change as more mailings are made
+plot(profit.log3, type="l", main="Profits", xlab="Mailings", ylab="$")
+n.mail.valid <- which.max(profit.log3) # number of mailings that maximizes profits
+results.log3 <- c(n.mail.valid, max(profit.log3)) # report number of mailings and maximum profit
+results.log3
+# 1343.0 11625.5
+
+cutoff.log3 <- sort(post.valid.log3, decreasing=T)[n.mail.valid+1] # set cutoff based on n.mail.valid
+chat.valid.log3 <- ifelse(post.valid.log3>cutoff.log3, 1, 0) # mail to everyone above the cutoff
+(cfs.log3 <- confusionMatrix(factor(chat.valid.log3), truth)$table)
+#          Reference
+#Prediction   0   1
+#         0 663  12
+#         1 356 987
+```
+
+###Quadratic Discriminant Analysis
+
+```{r qda1.c}
+model.qda1 <- qda(donr ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + I(hinc^2) + 
+                    genf + wrat + avhv + incm + inca + plow + npro + tgif + lgif + rgif + 
+                    tdon + tlag + agif, data.train.std.c) 
+model.qda1
+
+post.valid.qda1 <- predict(model.qda1, data.valid.std.c)$posterior[,2] # n.valid.c post probs
+
+profit.qda1 <- cumsum(don.avg*c.valid[order(post.valid.qda1, decreasing=T)]-mail.cost)
+
+# plot how profits change as more mailings are made
+plot(profit.qda1, type="l", main="Profits", xlab="Mailings", ylab="$")
+n.mail.valid <- which.max(profit.qda1) # number of mailings that maximizes profits
+results.qda1 <- c(n.mail.valid, max(profit.qda1))# report number of mailings and maximum profit
+# 1385.0 11222.5
+results.qda1
+
+cutoff.qda1 <- sort(post.valid.qda1, decreasing=T)[n.mail.valid+1] # set cutoff based on n.mail.valid
+chat.valid.qda1 <- ifelse(post.valid.qda1>cutoff.qda1, 1, 0) # mail to everyone above the cutoff
+(cfs.qda1 <- confusionMatrix(factor(chat.valid.qda1), truth)$table)
+#          Reference
+#Prediction   0   1
+#         0 599  34
+#         1 420 965
+```
+
+###K-Nearest Neighbors
+
+```{r KNN1.c}
+set.seed(824)
+model.knn1 <- knn(data.train.std.c[,1:20], data.valid.std.c[,1:20], 
+                  data.train.std.c[,21],k=200,prob=T)
+
+post.valid.knn1 <- attr(model.knn1,"prob") # n.valid post probs
+
+profit.knn1 <- cumsum(don.avg*c.valid[order(post.valid.knn1, decreasing=T)]-mail.cost)
+
+# plot how profits change as more mailings are made
+plot(profit.knn1, type="l", main="Profits", xlab="Mailings", ylab="$")
+n.mail.valid <- which.max(profit.knn1) # number of mailings that maximizes profits
+results.knn1 <- c(n.mail.valid, max(profit.knn1)) # report number of mailings and maximum profit
+results.knn1
+# 1927.0 10515.5
+
+cutoff.knn1 <- sort(post.valid.knn1, decreasing=T)[n.mail.valid+1] # set cutoff based on n.mail.valid
+chat.valid.knn1 <- ifelse(post.valid.knn1>cutoff.knn1, 1, 0) # mail to everyone above the cutoff
+(cfs.knn1<-confusionMatrix(factor(chat.valid.knn1), truth)$table)
+#          Reference
+#Prediction   0   1
+#         0  93  12
+#         1 926 987
+
+# Check number of mailings
+sum(cfs.knn1[2,])
+# Check potential profit
+don.avg*cfs.knn1[2,2] - 
+  mail.cost*sum(cfs.knn1[2,])
+# There are a number of ties because of the probabilies are calculated based 
+# on the discrete number of neighbours.
+```
+
+###Trees
+
+Regression tree.
+```{r tree1.c}
+set.seed(1036)
+model.tree1 <- tree(donr ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + I(hinc^2) + 
+                      genf + wrat + avhv + incm + inca + plow + npro + tgif + lgif + 
+                      rgif + tdon + tlag + agif, data=data.train.std.c)
+summary(model.tree1)
+plot(model.tree1)
+text(model.tree1,pretty=0)
+
+cv.model.tree1 <- cv.tree(model.tree1)
+cv.model.tree1
+par(mfrow=c(1,2))
+plot(cv.model.tree1$size, cv.model.tree1$dev, type="b")
+plot(cv.model.tree1$k, cv.model.tree1$dev, type="b")
+
+# tree does not need to be pruned
+
+post.valid.tree1 <- predict(model.tree1,data.valid.std.c, type="vector") # n.valid post probs
+
+profit.tree1 <- cumsum(don.avg*c.valid[order(post.valid.tree1, decreasing=T)]-mail.cost)
+
+# plot how profits change as more mailings are made
+plot(profit.tree1, type="l", main="Profits", xlab="Mailings", ylab="$")
+n.mail.valid <- which.max(profit.tree1) # number of mailings that maximizes profits
+results.tree1 <- c(n.mail.valid, max(profit.tree1)) # report number of mailings and maximum profit
+results.tree1
+# 1391 11312
+
+cutoff.tree1 <- sort(post.valid.tree1, decreasing=T)[n.mail.valid+1] # set cutoff based on n.mail.valid
+chat.valid.tree1 <- ifelse(post.valid.tree1>cutoff.tree1, 1, 0) # mail to everyone above the cutoff
+(cfs.tree1 <- confusionMatrix(factor(chat.valid.tree1), truth)$table)
+#          Reference
+#Prediction   0   1
+#         0 645  37
+#         1 374 962
+
+# Check number of mailings
+sum(cfs.tree1[2,])
+# Check potential profit
+don.avg*cfs.tree1[2,2] - 
+  mail.cost*sum(cfs.tree1[2,])
+# There are a number of ties because of the probabilies are calculated based on 
+# a discrete number of branches.
+```
+
+Build a tree with unstandardized variables and additional potential predictors for variable selection.
+
+```{r tree2.c}
+my.x.train <- charity[charity$part=="train",][,2:21]
+my.x.valid <- charity[charity$part=="valid",][,2:21]
+data.frame(my.x.train, donr=c.train) %>%
+  mutate(recent=ifelse(tdon<12,1,0),
+         donrdue=ifelse((tdon>12)&(tdon<24),1,0),
+         tgif.npro=tgif/npro,
+         incgif=ifelse((rgif>=agif),1,0)) -> my.train
+
+data.frame(my.x.valid, donr=c.valid) %>%
+  mutate(recent=ifelse(tdon<12,1,0),
+         donrdue=ifelse((tdon>12)&(tdon<24),1,0),
+         tgif.npro=tgif/npro,
+         incgif=ifelse((rgif>=agif),1,0)) -> my.valid
+
+set.seed(1036)
+model.tree2 <- tree(donr ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + I(hinc^2) + 
+                      genf + wrat + avhv + incm + inca + plow + npro + tgif + lgif + 
+                      rgif + tdon + tlag + agif + recent + donrdue + tgif.npro +incgif, data=my.train)
+summary(model.tree2)
+plot(model.tree2)
+text(model.tree2,pretty=0)
+# Variables actually used in tree construction: "chld" "home" "reg2" "reg1" "hinc" "wrat" "tdon"
+
+cv.model.tree2 <- cv.tree(model.tree2)
+cv.model.tree2
+par(mfrow=c(1,2))
+plot(cv.model.tree2$size, cv.model.tree2$dev, type="b")
+plot(cv.model.tree2$k, cv.model.tree2$dev, type="b")
+par(mfrow=c(1,1))
+# tree does not need to be pruned
+
+post.valid.tree2 <- predict(model.tree2,my.valid, type="vector") # n.valid post probs
+
+profit.tree2 <- cumsum(don.avg*c.valid[order(post.valid.tree2, decreasing=T)]-mail.cost)
+
+# plot how profits change as more mailings are made
+plot(profit.tree2, type="l", main="Profits", xlab="Mailings", ylab="$")
+n.mail.valid <- which.max(profit.tree2) # number of mailings that maximizes profits
+results.tree2 <- c(n.mail.valid, max(profit.tree2)) # report number of mailings and maximum profit
+results.tree2
+# 1347.0 10892.5
+
+cutoff.tree2 <- sort(post.valid.tree2, decreasing=T)[n.mail.valid+1] # set cutoff based on n.mail.valid
+chat.valid.tree2 <- ifelse(post.valid.tree2>cutoff.tree2, 1, 0) # mail to everyone above the cutoff
+(cfs.tree2 <- confusionMatrix(factor(chat.valid.tree2), truth)$table)
+#          Reference
+#Prediction   0   1
+#         0 631  69
+#         1 388 930
+
+# Check number of mailings
+sum(cfs.tree2[2,])
+# Check potential profit
+don.avg*cfs.tree2[2,2] - 
+  mail.cost*sum(cfs.tree2[2,])
+# There are a number of ties because of the probabilies are alculated based on 
+# a discrete number of branches.
+```
+
+###Bagging and Random Forest
+
+Apply bagging and random forests.
+Use the randomForest package with mtry=number of features to make a bagging model.
+
+```{r Bag1.c}
+set.seed(1213)
+model.bag1 <- randomForest(donrf ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + genf + 
+                             wrat + avhv + incm + inca + plow + npro + tgif + lgif + 
+                             rgif + tdon + tlag + agif, data=data.train.std.c, 
+                             mtry=20, importance=T)
+# Note the I(hinc^2) variable has been dropped because the random forest model 
+# seemed to have a problem with it.
+# The donors response was used as a factor and classification model created.
+model.bag1
+
+post.valid.bag1 <- predict(model.bag1, data.valid.std.c, type="prob")[,2] # n.valid post probs
+
+profit.bag1 <- cumsum(don.avg*c.valid[order(post.valid.bag1, decreasing=T)]-mail.cost)
+
+# plot how profits change as more mailings are made
+plot(profit.bag1, type="l", main="Profits", xlab="Mailings", ylab="$")
+n.mail.valid <- which.max(profit.bag1) # number of mailings that maximizes profits
+results.bag1 <- c(n.mail.valid, max(profit.bag1)) # report number of mailings and maximum profit
+results.bag1
+# 1293.0 11725.5
+# When Updated
+# 1307.0 11726.5
+
+cutoff.bag1 <- sort(post.valid.bag1, decreasing=T)[n.mail.valid+1] # set cutoff based on n.mail.valid
+chat.valid.bag1 <- ifelse(post.valid.bag1>cutoff.bag1, 1, 0) # mail to everyone above the cutoff
+(cfs.bag1 <- confusionMatrix(factor(chat.valid.bag1), truth)$table)
+#          Reference
+#Prediction   0   1
+#         0 713  12
+#         1 306 987
+
+#When Updated
+#         Reference
+#Prediction   0   1
+#         0 701  10
+#         1 318 989
+```
+
+###Bagging with regression model.
+
+```{r Bag2.c}
+set.seed(1213)
+model.bag2 <- randomForest(donr ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + genf + 
+                             wrat + avhv + incm + inca + plow + npro + tgif + lgif + 
+                             rgif + tdon + tlag + agif, data=data.train.std.c, 
+                           mtry=20, importance=T)
+# Using donr gives a warning that there are fewer than five unique values. Suggest classification rather than regression
+model.bag2
+
+post.valid.bag2 <- predict(model.bag2, data.valid.std.c, type="response")# n.valid post probs
+
+profit.bag2 <- cumsum(don.avg*c.valid[order(post.valid.bag2, decreasing=T)]-mail.cost)
+
+# plot how profits change as more mailings are made
+plot(profit.bag2, type="l", main="Profits", xlab="Mailings", ylab="$")
+n.mail.valid <- which.max(profit.bag2) # number of mailings that maximizes profits
+results.bag2 <- c(n.mail.valid, max(profit.bag2)) # report number of mailings and maximum profit
+results.bag2
+# 1281.0 11749.5
+#When Updated
+# 1293.0 11725.5
+
+cutoff.bag2 <- sort(post.valid.bag2, decreasing=T)[n.mail.valid+1] # set cutoff based on n.mail.valid
+chat.valid.bag2 <- ifelse(post.valid.bag2>cutoff.bag2, 1, 0) # mail to everyone above the cutoff
+confusionMatrix(factor(chat.valid.bag2), truth)$table
+#          Reference
+#Prediction   0   1
+#         0 725  12
+#         1 294 987
+#When Updated matches initial bag1 results above
+#         Reference
+#Prediction   0   1
+#         0 713  12
+#         1 306 987
+```
+
+###Random Forest with classification.
+
+```{r rf1.c}
+set.seed(112)
+grid.rf1 <- expand.grid(mtry = c(2,3,4,5,10,15,20),
+                        splitrule = c("gini", "extratrees"),
+                        min.node.size = c(1, 3, 5))
+model.rf1 <- train(donrf ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + genf + wrat + 
+                     avhv + incm + inca + plow + npro + tgif + lgif + rgif + tdon + 
+                     tlag + agif, tuneGrid = grid.rf1, 
+                   data=data.train.std.c, method = "ranger", importance="impurity", 
+                   trControl = trainControl(method = "cv", number = 10, classProbs=T))
+model.rf1
+plot(model.rf1)
+varImp(model.rf1)
+post.valid.rf1 <- predict(model.rf1, data.valid.std.c, type="prob")[,2] # n.valid post probs
+
+profit.rf1 <- cumsum(don.avg*c.valid[order(post.valid.rf1, decreasing=T)]-mail.cost)
+
+# plot how profits change as more mailings are made
+plot(profit.rf1, type="l", main="Profits", xlab="Mailings", ylab="$")
+n.mail.valid <- which.max(profit.rf1) # number of mailings that maximizes profits
+results.rf1 <- c(n.mail.valid, max(profit.rf1)) # report number of mailings and maximum profit
+results.rf1
+# 1236 11767
+# After Update which include the addition of tuning grid parameters.
+# 1295.0 11721.5
+
+cutoff.rf1 <- sort(post.valid.rf1, decreasing=T)[n.mail.valid+1] # set cutoff based on n.mail.valid
+chat.valid.rf1 <- ifelse(post.valid.rf1>cutoff.rf1, 1, 0) # mail to everyone above the cutoff
+(cfs.rf1 <- confusionMatrix(factor(chat.valid.rf1), truth)$table)
+#          Reference
+#Prediction   0   1
+#         0 765  17
+#         1 254 982
+# After Update
+#          Reference
+#Prediction   0   1
+#         0 711  12
+#         1 308 987
+```
+
+###Random Forest with regression.
+
+```{r rf2.c}
+set.seed(112)
+grid.rf2 <- expand.grid(mtry = c(2,3,4,5,10,15,20),
+                        splitrule = c("extratrees"),
+                        min.node.size = 1)
+model.rf2 <- train(donr ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + genf + wrat + 
+                     avhv + incm + inca + plow + npro + tgif + lgif + rgif + tdon + 
+                     tlag + agif, tuneGrid = grid.rf2, 
+                   data=data.train.std.c, method = "ranger", importance="impurity", 
+                   trControl = trainControl(method = "cv", number = 10))
+model.rf2
+plot(model.rf2)
+varImp(model.rf2)
+post.valid.rf2 <- predict(model.rf2, data.valid.std.c, type="raw") # n.valid post probs
+
+profit.rf2 <- cumsum(don.avg*c.valid[order(post.valid.rf2, decreasing=T)]-mail.cost)
+
+# plot how profits change as more mailings are made
+plot(profit.rf2, type="l", main="Profits", xlab="Mailings", ylab="$")
+n.mail.valid <- which.max(profit.rf2) # number of mailings that maximizes profits
+results.rf2 <- c(n.mail.valid, max(profit.rf2)) # report number of mailings and maximum profit
+results.rf2
+# 1219.0 11728.5
+# After update and tuning grid
+# 1264 11682
+
+cutoff.rf2 <- sort(post.valid.rf2, decreasing=T)[n.mail.valid+1] # set cutoff based on n.mail.valid
+chat.valid.rf2 <- ifelse(post.valid.rf2>cutoff.rf2, 1, 0) # mail to everyone above the cutoff
+confusionMatrix(factor(chat.valid.rf2), truth)$table
+#          Reference
+#Prediction   0   1
+#         0 777  22
+#         1 242 977
+# After update
+#          Reference
+#Prediction   0   1
+#         0 735  20
+#         1 284 979
+```
+
+###Boosting with regression
+
+```{r boost1.c}
+set.seed(759)
+#Max shrinkage
+max(0.01, 0.1*min(1, nrow(data.train.std.c)/10000))
+#Max interation.depth
+floor(sqrt(ncol(data.train.std.c)))
+
+gbmGrid <-  expand.grid(interaction.depth = 1,
+                    n.trees = (1:50)*50,
+                    shrinkage = seq(.001, .01,.001),
+                    n.minobsinnode = 10)
+model.boost1 <- train(donr ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + genf + wrat + 
+                        avhv + incm + inca + plow + npro + tgif + lgif + rgif + tdon + 
+                        tlag + agif, data=data.train.std.c, distribution="gaussian", 
+                      method="gbm", verbose = F, tuneGrid=gbmGrid, 
+                      trControl=trainControl(method = "cv", number = 5))
+model.boost1
+plot(model.boost1)
+
+post.valid.boost1 <- predict(model.boost1, data.valid.std.c, n.trees=2500) 
+# n.valid post probs
+
+profit.boost1 <- cumsum(don.avg*c.valid[order(post.valid.boost1, decreasing=T)]-mail.cost)
+
+# plot how profits change as more mailings are made
+plot(profit.boost1, type="l", main="Profits", xlab="Mailings", ylab="$")
+n.mail.valid <- which.max(profit.boost1) # number of mailings that maximizes profits
+results.boost1 <- c(n.mail.valid, max(profit.boost1)) # report number of mailings and maximum profit
+results.boost1
+# 1241.0 11887.5
+# After update
+# 1258.0 11882.5
+
+cutoff.boost1 <- sort(post.valid.boost1, decreasing=T)[n.mail.valid+1] # set cutoff based on n.mail.valid
+chat.valid.boost1 <- ifelse(post.valid.boost1>cutoff.boost1, 1, 0) # mail to everyone above the cutoff
+confusionMatrix(factor(chat.valid.boost1), truth)$table
+#          Reference
+#Prediction   0   1
+#         0 769   8
+#         1 250 991
+# After update
+#         Reference
+#Prediction   0   1
+#         0 754   6
+#         1 265 993
+```
+
+###Support Vector Machine
+
+```{r SVM1.c}
+# SVM predictor needs to be a factor to trigger classification method.
+
+set.seed(1011)
+tune.out=tune(svm, donrf ~ reg1 + reg2 + reg3 + reg4 + home 
+              + chld + hinc + I(hinc^2) + genf + wrat + avhv 
+              + incm + inca + plow + npro + tgif + lgif + rgif 
+              + tdon + tlag + agif, data=data.train.std.c, 
+              kernel="linear", 
+              ranges=list(cost=c(0.01, 0.1, 0.5, 1, 5, 10)), 
+              scale=F, probability=T)
+model.svm1 <- tune.out$best.model
+summary(tune.out)
+
+post.valid.svm1 <- attr(predict(model.svm1, data.valid.std.c, probability=T),"probabilities")[,2] # n.valid.c post probs
+
+profit.svm1 <- cumsum(don.avg*c.valid[order(post.valid.svm1, decreasing=T)]-mail.cost)
+
+# plot how profits change as more mailings are made
+plot(profit.svm1, type="l", main="Profits", xlab="Mailings", ylab="$")
+n.mail.valid <- which.max(profit.svm1) # number of mailings that maximizes profits
+results.svm1 <- c(n.mail.valid, max(profit.svm1))# report number of mailings and maximum profit
+results.svm1
+#  1315 11638
+cutoff.svm1 <- sort(post.valid.svm1, decreasing=T)[n.mail.valid+1] # set cutoff based on n.mail.valid
+chat.valid.svm1 <- ifelse(post.valid.svm1>cutoff.svm1, 1, 0) # mail to everyone above the cutoff
+
+confusionMatrix(factor(chat.valid.svm1), truth)$table
+#          Reference
+#Prediction   0   1
+#         0 688  15
+#         1 331 984
+```
+
+###Results 
+
+```{r Classification Results}
+# Create a summary table of classification results withhighest profit for each technique.
+results.class <- as.data.frame(rbind(results.lda2, results.log2, results.qda1, 
+                                     results.knn1, results.tree2, results.bag2, 
+                                     results.rf1, results.boost1, results.svm1), 
+                               row.names=c("Linear Discriminant Analysis",
+                                           "Logistic Regression", 
+                                           "Quadratic Discriminant Analysis", 
+                                           "K-nearest Neighbors", 
+                                           "Decision Tree", "Bagging", 
+                                           "Random Forest", "Boosting", 
+                                           "Support Vector Classifier"))
+colnames(results.class) <- c("Number of Mailings","Profit")
+results.class[order(results.class$Profit,decreasing=T),]
+
+```
+
+###Select and Adjust for Oversampling
+Select the best model and use it to determine the mailing list for the test set of data.  The model provided by boosting maximizes profit in the validation sample.
+
+```{r Classification Select}
+
+# calculate the posterior probabilites for test data and boost model
+post.test.boost1 <- predict(model.boost1, data.test.std, n.trees=2500) 
+
+# Oversampling adjustment for calculating number of mailings for test set
+n.mail.valid <- which.max(profit.boost1)
+tr.rate <- .1 # typical response rate is .1
+vr.rate <- .5 # whereas validation response rate is .5
+adj.test.1 <- (n.mail.valid/n.valid.c)/(vr.rate/tr.rate) # adjustment for mail yes
+adj.test.0 <- ((n.valid.c-n.mail.valid)/n.valid.c)/((1-vr.rate)/(1-tr.rate)) # adjustment for mail no
+adj.test <- adj.test.1/(adj.test.1+adj.test.0) # scale into a proportion
+n.mail.test <- round(n.test*adj.test, 0) # calculate number of mailings for test set
+
+# set a cutoff based on the number of mailings scaled for the test set
+# sort the test set by probability of donating from highest to lowest
+cutoff.test <- sort(post.test.boost1, decreasing=T)[n.mail.test+1] 
+
+# mail to everyone above the cutoff 
+chat.test <- ifelse(post.test.boost1>cutoff.test, 1, 0) 
+table(chat.test)
+#    0    1 
+# 1705  302
+# based on this model we'll mail to the 302 highest posterior probabilities
+# After update
+#   0    1 
+#1695  312
+```
+
+Prediction Models
+-----------------
+
+###Tree Models for Variable Selection
+
+Build a single tree on unstandardized variable and additional predictors to identify a simple decision rule and inform variable selection.
+
+```{r tree1.y}
+set.seed(115)
+my.x.train <- charity[charity$part=="train",][,2:21]
+my.x.valid <- charity[charity$part=="valid",][,2:21]
+data.frame(my.x.train[c.train==1,], damt=y.train) %>%
+  mutate(recent=ifelse(tdon<12,1,0),
+         donrdue=ifelse((tdon>12)&(tdon<24),1,0),
+         tgif.npro=tgif/npro,
+         incgif=ifelse((rgif>=agif),1,0)) -> my.train
+
+data.frame(my.x.valid[c.valid==1,], damt=y.valid) %>%
+  mutate(recent=ifelse(tdon<12,1,0),
+         donrdue=ifelse((tdon>12)&(tdon<24),1,0),
+         tgif.npro=tgif/npro,
+         incgif=ifelse((rgif>=agif),1,0)) -> my.valid
+
+model.tree1.y <- tree(damt ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + I(hinc^2) + 
+                        genf + wrat + avhv + incm + inca + plow + npro + tgif + lgif + 
+                        rgif + tdon + tlag + agif + recent + donrdue + tgif.npro + incgif, 
+                      data=my.train)
+summary(model.tree1.y)
+plot(model.tree1.y)
+text(model.tree1.y,pretty=0)
+# variables used: rgif, lgif, reg4, chld, reg3
+
+cv.model.tree1.y <- cv.tree(model.tree1.y)
+cv.model.tree1.y
+par(mfrow=c(1,2))
+plot(cv.model.tree1.y$size, cv.model.tree1.y$dev, type="b")
+plot(cv.model.tree1.y$k, cv.model.tree1.y$dev, type="b")
+# tree does not need to be pruned
+
+# calculate the donation predictions on the validation data
+pred.valid.tree1.y <- predict(model.tree1.y, newdata=my.valid, type="vector") 
+(MPE.tree1.y <- mean((y.valid - pred.valid.tree1.y)^2)) # mean prediction error
+# 2.241075
+(STDE.tree1.y <- sd((y.valid - pred.valid.tree1.y)^2)/sqrt(n.valid.y)) # std error
+# 0.1920681
+results.tree1.y <- c(MPE.tree1.y, STDE.tree1.y)
+```
+
+Build a tree on transformed and standardized variables. The results are the same.
+
+```{r tree2.y}
+set.seed(1112)
+model.tree2.y <- tree(damt ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + I(hinc^2) + 
+                        genf + wrat + avhv + incm + inca + plow + npro + tgif + lgif + 
+                        rgif + tdon + tlag + agif, data=data.train.std.y)
+summary(model.tree2.y)
+# variables used: rgif, lgif, reg4, chld, reg3
+
+# calculate the donation predictions on the validation data
+pred.valid.tree2.y <- predict(model.tree2.y,newdata=data.valid.std.y, type="vector")
+(MPE.tree2.y <- mean((y.valid - pred.valid.tree2.y)^2)) # mean prediction error
+# 2.241075
+(STDE.tree2.y <- sd((y.valid - pred.valid.tree2.y)^2)/sqrt(n.valid.y)) # std error
+# 0.1920681
+results.tree2.y <- c(MPE.tree2.y, STDE.tree2.y)
+```
+
+###Least Squares Regression
+
+Perform Least Squares regression with all variables that have been transformed and standardized.
+
+```{r ls1.y}
+model.ls1.y <- lm(damt ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + I(hinc^2) + 
+                    genf + wrat + avhv + incm + inca + plow + npro + tgif + lgif + rgif + 
+                    tdon + tlag + agif, data.train.std.y)
+summary(model.ls1.y)
+vif(model.ls1.y)
+
+# calculate the donation predictions on the validation data
+pred.valid.ls1.y <- predict(model.ls1.y, newdata = data.valid.std.y)
+(MPE.ls1.y <- mean((y.valid - pred.valid.ls1.y)^2)) # mean prediction error
+# 1.522279
+(STDE.ls1.y <- sd((y.valid - pred.valid.ls1.y)^2)/sqrt(n.valid.y)) # std error
+# 0.1608573
+results.ls1.y <- c(MPE.ls1.y, STDE.ls1.y)
+```
+
+###Least Squares regression with stepwise selection.
+
+THe same model is also obtained when using forward, backward and stepwise selection.
+
+```{r ls2.y}
+# create a null model
+model.ls0.y <- lm(damt ~ 1, data=data.train.std.y)
+# use the step() function for variable selection
+model.ls2.y <- step(model.ls0.y, scope=list(upper=model.ls1.y), data=data.train.std.y, 
+                    direction="both", k=2)
+
+# Variables selected: lgif, reg4, chld, hinc, reg3, rgif, tgif, agif, incm , plow, home,
+# genf, tdon, reg2 and npro
+
+# calculate the donation predictions on the validation data
+pred.valid.ls2.y <- predict(model.ls2.y, newdata = data.valid.std.y)
+(MPE.ls2.y <- mean((y.valid - pred.valid.ls2.y)^2)) # mean prediction error
+# 1.525625
+(STDE.ls2.y <- sd((y.valid - pred.valid.ls2.y)^2)/sqrt(n.valid.y)) # std error
+# 0.1603889
+results.ls2.y <- c(MPE.ls2.y, STDE.ls2.y)
+```
+
+###Ridge Regression
+
+```{r ridge1.y}
+set.seed(228)
+cv.out <- cv.glmnet(x=x.train.std[c.train==1,], y=y.train, alpha=0)
+plot(cv.out)
+bestlam =cv.out$lambda.min 
+
+model.ridge1.y <- glmnet(x=x.train.std[c.train==1,], y=y.train, alpha=0, lambda=bestlam)
+model.ridge1.y
+
+# 
+pred.valid.ridge1.y <- predict(model.ridge1.y, s=bestlam, newx=x.valid.std[c.valid==1,])
+
+(MPE.ridge1.y <- mean((y.valid - pred.valid.ridge1.y)^2)) # mean prediction error
+# 1.55537
+(STDE.ridge1.y <- sd((y.valid - pred.valid.ridge1.y)^2)/sqrt(n.valid.y)) # std error
+# 0.1632576
+results.ridge1.y <- c(MPE.ridge1.y, STDE.ridge1.y)
+```
+###The Lasso
+
+```{r lasso1.y}
+set.seed(519)
+cv.out <- cv.glmnet(x=x.train.std[c.train==1,], y=y.train, alpha=1)
+plot(cv.out)
+bestlam =cv.out$lambda.min 
+
+grid <- 10^seq(10,-2, length =100)
+model.lasso1.y <- glmnet(x=x.train.std[c.train==1,], y=y.train, alpha=1, lambda=bestlam)
+model.lasso1.y
+
+# calculate the donation predictions on the validation data
+pred.valid.lasso1.y <- predict(model.lasso1.y, s=bestlam, newx=x.valid.std[c.valid==1,])
+
+pred.lasso1.coef <- predict(model.lasso1.y,type="coefficients", s=bestlam)[1:21,]
+pred.lasso1.coef
+
+(MPE.lasso1.y <- mean((y.valid - pred.valid.lasso1.y)^2)) # mean prediction error
+# 1.538479
+(STDE.lasso1.y <- sd((y.valid - pred.valid.lasso1.y)^2)/sqrt(n.valid.y)) # std error
+# 0.1616434
+results.lasso1.y <- c(MPE.lasso1.y, STDE.lasso1.y)
+```
+###Random Forest
+
+```{r rf1.y}
+set.seed(551)
+grid.rf1.y <- expand.grid(mtry=c(2,3,4,5,10,15,20), splitrule="extratrees", min.node.size=1)
+model.rf1.y <- train(damt ~ reg1 + reg2 + reg3 + reg4 + home + chld + hinc + genf + wrat + 
+                       avhv + incm + inca + plow + npro + tgif + lgif + rgif + tdon + 
+                       tlag + agif, tuneGrid = grid.rf1.y, 
+                     data=data.train.std.y, method = "ranger", importance="impurity", 
+                     trControl = trainControl(method = "cv", number = 10, classProbs=F))
+model.rf1.y
+plot(model.rf1.y)
+varImp(model.rf1.y)
+
+# calculate the donation predictions on the validation data
+pred.valid.rf1.y <- predict(model.rf1.y, data.valid.std.y, type="raw")
+(MPE.rf1.y <- mean((y.valid - pred.valid.rf1.y)^2)) # mean prediction error
+# 1.671824
+# After Update
+# 1.62468
+(STDE.rf1.y <- sd((y.valid - pred.valid.rf1.y)^2)/sqrt(n.valid.y)) # std error
+# 0.1734583
+# After update
+# 0.1722385
+results.rf1.y <- c(MPE.rf1.y, STDE.rf1.y)
+```
+
+
+###Boosting
+```{r boost1.y}
+set.seed(616)
+#Max shrinkage
+max(0.01, 0.1*min(1, nrow(data.train.std.y)/10000)) # 0.2
+#Max interation.depth
+floor(sqrt(ncol(data.train.std.y))) # 4
+
+gbmGrid <-  expand.grid(interaction.depth = 1,
+                    n.trees = (1:10)*500,
+                    shrinkage = seq(.001, .01,.001),
+                    n.minobsinnode = 10)
+
+model.boost1.y <- train(damt~., data=data.train.std.y, distribution="gaussian", 
+                        method="gbm", verbose = F, tuneGrid=gbmGrid, 
+                        trControl=trainControl(method = "cv", number = 5))
+model.boost1.y$finalModel$n.trees
+summary(model.boost1.y)
+plot(model.boost1.y)
+
+# calculate the donation predictions on the validation data
+pred.valid.boost1.y <- predict(model.boost1.y, data.valid.std.y, 
+                               n.trees=model.boost1.y$finalModel$n.trees) 
+(MPE.boost1.y <- mean((y.valid - pred.valid.boost1.y)^2)) # mean prediction error
+# 1.327743
+# After update
+# 1.328847
+(STDE.boost1.y <- sd((y.valid - pred.valid.boost1.y)^2)/sqrt(n.valid.y)) # std error
+# 0.1517995
+# After update
+# 0.151604
+# predicted profit
+
+results.boost1.y <- c(MPE.boost1.y, STDE.boost1.y)
+```
+
+###Results
+
+Capture the best results for each technique and summarize.
+
+```{r Prediction Results}
+results.pred <- as.data.frame(rbind(results.tree1.y, results.ls1.y, results.ridge1.y, 
+                                    results.lasso1.y, results.rf1.y, results.boost1.y), 
+                              row.names=c("Decision Tree", "Least Squares Regression", 
+                                          "Ridge Regression", "Lasso", "Random Forest", 
+                                          "Boosting"))
+colnames(results.pred) <- c("MPE","STDE")
+results.pred[order(results.pred$MPE,decreasing=F),]
+```
+
+###Select
+
+```{r Prediction Select}
+# select model.boost1.y since it has minimum mean prediction error in the validation sample
+
+yhat.test <- predict(model.boost1.y, newdata = data.test.std) # test predictions
+```
+
+##FINAL RESULTS
+
+```{r FINAL RESULTS}
+# Profit if mailing randomly selected
+n.mail.test*(tr.rate*don.avg-mail.cost)
+# Estimated profit on test data set
+sum(chat.test*yhat.test)-n.mail.test*mail.cost
+# Average estimated donation on the test data set
+sum(chat.test*yhat.test)/n.mail.test
+# This close to the expected donation that was input in the model.
+
+# Save final results for both classification and regression
+length(chat.test) # check length = 2007
+length(yhat.test) # check length = 2007
+chat.test[1:10] # check this consists of 0s and 1s
+yhat.test[1:10] # check this consists of plausible predictions of damt
+
+ip <- data.frame(chat=chat.test, yhat=yhat.test) # data frame with two variables: chat and yhat
+write.csv(ip, file="MJF.csv", row.names=FALSE) # use your initials for the file name
+
+# Check that the predicted values are consistent with data exploration
+ggplot(data=cbind(data.test,ip), aes(y=yhat, x=rgif)) +
+  geom_point()
+
+ggplot(data=cbind(data.test,ip), aes(as.factor(chat), chld)) + geom_boxplot()
+```
+
+### Boosting versus Decision Trees
+
+Compare results of using boosting models for classification and prediction to the simplest solution of using decision trees for for comparison.
+
+```{r Boost vs Trees}
+# Get the number of mailings recommended by the boosting model
+(n.mail.boosts <- sum(chat.valid.boost1))
+# Get the number of mailings recommended by the decision tree model
+(n.mail.trees <- sum(chat.valid.tree2))
+
+# Make data frames of all validation data plus damt both
+# original
+y.valid.all <- data.valid[,23]
+data.frame(x.valid, damt=y.valid.all) %>%
+  mutate(recent=ifelse(tdon<12,1,0),
+         donrdue=ifelse((tdon>12)&(tdon<24),1,0),
+         tgif.npro=tgif/npro,
+         incgif=ifelse((rgif>=agif),1,0)) -> data.valid.y.all
+
+# standardized
+data.valid.std.y.all <- data.frame(x.valid.std, damt=y.valid.all)
+
+# Use the boosting model to predict the amount donated by all donors in the validation data
+yhat.valid.boosts <- predict(model.boost1.y, data.valid.std.y.all, n.trees=5000)
+# Sort the 
+data.valid.std.all <- data.frame(data.valid.std.y.all,
+                                   yhat.boosts=yhat.valid.boosts,
+                                   chat.boosts=chat.valid.boost1)
+# Profit generated by using boosting models on validation set data
+(profit.boosts <- sum(data.valid.std.all[chat.valid.boost1==1,]$damt)-mail.cost*n.mail.boosts)
+# Average donation per mailing
+(average.boosts <- profit.boosts/n.mail.boosts)
+
+
+# Use the tree models to predict the amount donated by all donors in the validation data
+yhat.valid.trees <- predict(model.tree1.y, newdata=data.valid.y.all, type="vector")
+data.valid.all <- data.frame(data.valid.y.all,
+                                   yhat.trees=yhat.valid.trees,
+                                   chat.trees=chat.valid.tree2)
+# Profit generated by using tree models on validation set data
+(profit.trees <- sum(data.valid.all[chat.valid.tree2==1,]$damt)-mail.cost*n.mail.trees)
+# Average donation on the test data set
+(average.trees <- profit.trees/n.mail.trees)
+
+# Increase in profits of boosting over trees 
+(profit.boosts-profit.trees)/profit.trees
+
+# Increase in average donation of boosting over trees
+(average.boosts-average.trees)/average.trees
+```
+
